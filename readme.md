@@ -27,7 +27,7 @@ To use mTcp xmodem / ymodem ensure you have lrzsz installed
 
 ```
 sz <file> # send file     - Alt+D on mTcp (download)
-rz <file> # receive file  - Alt+U on mTcp (upload)
+rb --ymodem # receive file  - Alt+U on mTcp (upload)
 ```
 
 

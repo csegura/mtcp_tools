@@ -16,6 +16,7 @@
  *   - TYPE
  *   - PASV
  *   - NLST
+ *   - LIST
  *   - RETR
  *   - STOR
  *   - QUIT
@@ -64,6 +65,7 @@ bool cmd_cwd(ClientConnection *conn, const char *arg);
 bool cmd_type(ClientConnection *conn, const char *arg);
 bool cmd_pasv(ClientConnection *conn, const char *arg);
 bool cmd_nlst(ClientConnection *conn, const char *arg);
+bool cmd_dir(ClientConnection *conn, const char *arg);
 bool cmd_retr(ClientConnection *conn, const char *arg);
 bool cmd_stor(ClientConnection *conn, const char *arg);
 bool cmd_quit(ClientConnection *conn, const char *arg);
@@ -72,7 +74,7 @@ FtpCommand ftp_commands[] = {
     {"USER", cmd_user}, {"PASS", cmd_pass}, {"PWD", cmd_pwd},
     {"CWD", cmd_cwd},   {"TYPE", cmd_type}, {"PASV", cmd_pasv},
     {"NLST", cmd_nlst}, {"RETR", cmd_retr}, {"STOR", cmd_stor},
-    {"QUIT", cmd_quit}, {NULL, NULL}};
+    {"QUIT", cmd_quit}, {"LIST", cmd_dir},  {NULL, NULL}};
 
 char server_ip[16] = "";
 int server_port = DEFAULT_PORT;
@@ -128,6 +130,7 @@ void handle_client(ClientConnection *conn);
 bool handle_command(ClientConnection *conn, char *buffer);
 void send_response(int socket, const char *format, ...);
 void list_directory(int socket, const char *path);
+void list_directory_extend(int socket, const char *path);
 void send_file(int socket, const char *filename);
 void receive_file(int socket, const char *filename);
 void change_directory(ClientConnection *conn, const char *path);
@@ -321,6 +324,29 @@ void list_directory(int socket, const char *path) {
 
   dir = opendir(path);
   if (dir == NULL) {
+    perror(ERR_OPEN_DIR);
+    return;
+  }
+
+  while ((entry = readdir(dir)) != NULL) {
+    // skip . and ..
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    snprintf(buffer, BUFFER_SIZE, "%s\r\n", entry->d_name);
+    send(socket, buffer, strlen(buffer), 0);
+  }
+
+  closedir(dir);
+}
+
+void list_directory_extend(int socket, const char *path) {
+  DIR *dir;
+  struct dirent *entry;
+  char buffer[BUFFER_SIZE];
+
+  dir = opendir(path);
+  if (dir == NULL) {
 
     perror(ERR_OPEN_DIR);
     return;
@@ -385,6 +411,7 @@ void send_file(int socket, const char *filename) {
   char buffer[BUFFER_SIZE];
   ssize_t bytes_read;
 
+  printf("- sending file %s\n", filename);
   file_fd = open(filename, O_RDONLY);
   if (file_fd == -1) {
     perror(ERR_OPEN_FILE);
@@ -437,6 +464,7 @@ void receive_file(int socket, const char *filename) {
   char buffer[BUFFER_SIZE];
   ssize_t bytes_received;
 
+  printf("- receiving file %s\n", filename);
   file_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (file_fd == -1) {
     perror(ERR_CREATE_FILE);
@@ -504,6 +532,20 @@ bool cmd_nlst(ClientConnection *conn, const char *arg) {
   return false;
 }
 
+bool cmd_dir(ClientConnection *conn, const char *arg) {
+  send_response(conn->control_socket, MSG_LIST_START);
+  int data_conn = accept(conn->data_socket, NULL, NULL);
+  if (data_conn < 0) {
+    perror(ERR_ACCEPT_FAIL);
+    send_response(conn->control_socket, MSG_DATA_CONN_FAIL);
+  } else {
+    list_directory_extend(data_conn, conn->current_dir);
+    close(data_conn);
+    send_response(conn->control_socket, MSG_RETR_END);
+  }
+  return false;
+}
+
 bool cmd_retr(ClientConnection *conn, const char *arg) {
   send_response(conn->control_socket, MSG_STOR_START);
   int data_conn = accept(conn->data_socket, NULL, NULL);
@@ -517,6 +559,36 @@ bool cmd_retr(ClientConnection *conn, const char *arg) {
     close(data_conn);
     send_response(conn->control_socket, MSG_RETR_END);
   }
+  return false;
+}
+
+bool cmd_mretr(ClientConnection *conn, const char *arg) {
+  char *token;
+  char *saveptr;
+  char args_copy[MAX_PATH];
+
+  strncpy(args_copy, arg, MAX_PATH - 1);
+  args_copy[MAX_PATH - 1] = '\0';
+
+  token = strtok_r(args_copy, " ", &saveptr);
+
+  while (token != NULL) {
+    send_response(conn->control_socket, MSG_STOR_START);
+    int data_conn = accept(conn->data_socket, NULL, NULL);
+    if (data_conn < 0) {
+      perror(ERR_ACCEPT_FAIL);
+      send_response(conn->control_socket, MSG_DATA_CONN_FAIL);
+    } else {
+      char full_path[MAX_PATH];
+      snprintf(full_path, MAX_PATH, "%s/%s", conn->current_dir, token);
+      send_file(data_conn, full_path);
+      close(data_conn);
+      send_response(conn->control_socket, MSG_RETR_END);
+    }
+
+    token = strtok_r(NULL, " ", &saveptr);
+  }
+
   return false;
 }
 

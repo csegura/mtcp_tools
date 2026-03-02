@@ -40,11 +40,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PORT 21
+#define PORT 2121
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 5
 #define MAX_PATH 512
-#define DEFAULT_PORT 21
+#define DEFAULT_PORT 2121
 
 typedef struct {
   int control_socket;
@@ -78,6 +78,7 @@ FtpCommand ftp_commands[] = {
 
 char server_ip[16] = "";
 int server_port = DEFAULT_PORT;
+char initial_dir[MAX_PATH];
 
 #define MSG_RUNNING "FTP server listening on port %d\n"
 #define MSG_NEW_CLIENT "New client connected from %s\n"
@@ -166,6 +167,14 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
+  if (getcwd(initial_dir, MAX_PATH) == NULL) {
+    perror(ERR_GETCWD_FAIL);
+    return 1;
+  }
+
+  printf(MSG_RUNNING, server_port);
+  printf(LOG_CWD, initial_dir);
+
   while (1) {
     ClientConnection conn;
     struct sockaddr_in client_addr;
@@ -181,14 +190,9 @@ int main(int argc, char *argv[]) {
     printf(MSG_NEW_CLIENT, inet_ntoa(client_addr.sin_addr));
     conn.data_socket = create_data_socket();
     conn.client_addr = client_addr.sin_addr;
-    if (getcwd(conn.current_dir, MAX_PATH) != NULL) {
-
-      printf(LOG_CWD, conn.current_dir);
-    } else {
-
-      perror(ERR_GETCWD_FAIL);
-      return 1;
-    }
+    strncpy(conn.current_dir, initial_dir, MAX_PATH - 1);
+    conn.current_dir[MAX_PATH - 2] = '\0';
+    printf(LOG_CWD, conn.current_dir);
 
     if (conn.data_socket < 0) {
       send_response(conn.control_socket, MSG_DATA_CONN_FAIL);
@@ -250,6 +254,13 @@ int create_data_socket() {
     return -1;
   }
 
+  int enable = 1;
+  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
+    perror(ERR_SETSOCKOPT_FAIL);
+    close(sock);
+    return -1;
+  }
+
   struct sockaddr_in addr = {
       .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = 0};
 
@@ -276,6 +287,9 @@ void handle_client(ClientConnection *conn) {
   socklen_t len = sizeof(addr);
   getsockname(conn->data_socket, (struct sockaddr *)&addr, &len);
 
+  struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+  setsockopt(conn->control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
   send_response(conn->control_socket, MSG_WELCOME);
 
   while (1) {
@@ -299,8 +313,11 @@ void handle_client(ClientConnection *conn) {
 
   printf(LOG_CLOSING, inet_ntoa(conn->client_addr));
 
+  shutdown(conn->data_socket, SHUT_RDWR);
   close(conn->data_socket);
+  shutdown(conn->control_socket, SHUT_RDWR);
   close(conn->control_socket);
+  chdir(initial_dir);
 }
 
 void send_response(int socket, const char *format, ...) {
@@ -452,7 +469,7 @@ void change_directory(ClientConnection *conn, const char *path) {
 
   // Check if the directory exists and is accessible
   if (chdir(resolved_path) == 0) {
-    strncpy(conn->current_dir, resolved_path, MAX_PATH);
+    strncpy(conn->current_dir, resolved_path, MAX_PATH-1);
     send_response(conn->control_socket, MSG_CWD_OK);
   } else {
     send_response(conn->control_socket, MSG_CWD_FAIL);
@@ -510,8 +527,10 @@ bool cmd_pasv(ClientConnection *conn, const char *arg) {
   int data_port = ntohs(addr.sin_port);
 
   int ip[4];
+  
   sscanf(server_ip, "%d.%d.%d.%d", &ip[0], &ip[1], &ip[2], &ip[3]);
-
+  printf("PASV: %d.%d.%d.%d:%d\n", ip[0], ip[1], ip[2], ip[3], data_port);
+  printf("IP: %4d %4d %4d %4d\n", ip[0], ip[1], ip[2], ip[3]);
   send_response(conn->control_socket, MSG_ENTER_PASV, ip[0], ip[1], ip[2],
                 ip[3], data_port / 256, data_port % 256);
 
@@ -526,6 +545,7 @@ bool cmd_nlst(ClientConnection *conn, const char *arg) {
     send_response(conn->control_socket, MSG_DATA_CONN_FAIL);
   } else {
     list_directory(data_conn, conn->current_dir);
+    shutdown(data_conn, SHUT_RDWR);
     close(data_conn);
     send_response(conn->control_socket, MSG_RETR_END);
   }
@@ -540,6 +560,7 @@ bool cmd_dir(ClientConnection *conn, const char *arg) {
     send_response(conn->control_socket, MSG_DATA_CONN_FAIL);
   } else {
     list_directory_extend(data_conn, conn->current_dir);
+    shutdown(data_conn, SHUT_RDWR);
     close(data_conn);
     send_response(conn->control_socket, MSG_RETR_END);
   }
@@ -556,6 +577,7 @@ bool cmd_retr(ClientConnection *conn, const char *arg) {
     char full_path[MAX_PATH];
     snprintf(full_path, MAX_PATH, "%s/%s", conn->current_dir, arg);
     send_file(data_conn, full_path);
+    shutdown(data_conn, SHUT_RDWR);
     close(data_conn);
     send_response(conn->control_socket, MSG_RETR_END);
   }
@@ -582,6 +604,7 @@ bool cmd_mretr(ClientConnection *conn, const char *arg) {
       char full_path[MAX_PATH];
       snprintf(full_path, MAX_PATH, "%s/%s", conn->current_dir, token);
       send_file(data_conn, full_path);
+      shutdown(data_conn, SHUT_RDWR);
       close(data_conn);
       send_response(conn->control_socket, MSG_RETR_END);
     }
@@ -602,6 +625,7 @@ bool cmd_stor(ClientConnection *conn, const char *arg) {
     char full_path[MAX_PATH];
     snprintf(full_path, MAX_PATH, "%s/%s", conn->current_dir, arg);
     receive_file(data_conn, full_path);
+    shutdown(data_conn, SHUT_RDWR);
     close(data_conn);
     send_response(conn->control_socket, MSG_STOR_END);
   }
